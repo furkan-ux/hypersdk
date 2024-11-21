@@ -7,6 +7,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var importAvalancheCliChainCmd = &cobra.Command{
+	Use: "import-cli [path]",
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) != 1 {
+			return ErrInvalidArgs
+		}
+		return nil
+	},
+	RunE: func(_ *cobra.Command, args []string) error {
+		return handler.Root().ImportClusterInfo(args[0])
+	},
+}
+
 var chainCmd = &cobra.Command{
 	Use: "chain",
 	RunE: func(*cobra.Command, []string) error {

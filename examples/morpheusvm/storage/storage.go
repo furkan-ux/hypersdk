@@ -5,21 +5,24 @@ package storage
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 
 	"github.com/ava-labs/avalanchego/database"
-
+	smath "github.com/ava-labs/avalanchego/utils/math"
 	"github.com/ava-labs/hypersdk/codec"
 	"github.com/ava-labs/hypersdk/consts"
 	"github.com/ava-labs/hypersdk/state"
-	"github.com/ava-labs/hypersdk/state/metadata"
-
-	smath "github.com/ava-labs/avalanchego/utils/math"
+	"github.com/ava-labs/subnet-evm/core/types"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/holiman/uint256"
 )
 
 type ReadState func(context.Context, [][]byte) ([][]byte, []error)
+
+func ConvertAddress(addr codec.Address) common.Address {
+	return common.BytesToAddress(addr[:])
+}
 
 // State
 // 0x0/ (hypersdk-height)
@@ -29,94 +32,72 @@ type ReadState func(context.Context, [][]byte) ([][]byte, []error)
 // 0x3/ (balance)
 //   -> [owner] => balance
 
-const balancePrefix byte = metadata.DefaultMinimumPrefix
-
-const BalanceChunks uint16 = 1
-
-// [balancePrefix] + [address]
-func BalanceKey(addr codec.Address) (k []byte) {
-	k = make([]byte, 1+codec.AddressLen+consts.Uint16Len)
-	k[0] = balancePrefix
-	copy(k[1:], addr[:])
-	binary.BigEndian.PutUint16(k[1+codec.AddressLen:], BalanceChunks)
-	return
-}
-
 // If locked is 0, then account does not exist
 func GetBalance(
 	ctx context.Context,
 	im state.Immutable,
-	addr codec.Address,
-) (uint64, error) {
-	_, bal, _, err := getBalance(ctx, im, addr)
-	return bal, err
-}
-
-func getBalance(
-	ctx context.Context,
-	im state.Immutable,
-	addr codec.Address,
-) ([]byte, uint64, bool, error) {
-	k := BalanceKey(addr)
-	bal, exists, err := innerGetBalance(im.GetValue(ctx, k))
-	return k, bal, exists, err
-}
-
-// Used to serve RPC queries
-func GetBalanceFromState(
-	ctx context.Context,
-	f ReadState,
-	addr codec.Address,
-) (uint64, error) {
-	k := BalanceKey(addr)
-	values, errs := f(ctx, [][]byte{k})
-	bal, _, err := innerGetBalance(values[0], errs[0])
-	return bal, err
-}
-
-func innerGetBalance(
-	v []byte,
-	err error,
-) (uint64, bool, error) {
+	addr common.Address,
+) (balance uint64, err error) {
+	k := AccountKey(addr)
+	val, err := im.GetValue(ctx, k)
 	if errors.Is(err, database.ErrNotFound) {
-		return 0, false, nil
+		return 0, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
-	val, err := database.ParseUInt64(v)
+	account, err := DecodeAccount(val)
 	if err != nil {
-		return 0, false, err
+		return 0, fmt.Errorf("failed to decode account: %w", err)
 	}
-	return val, true, nil
+	return account.Balance.Uint64(), nil
 }
 
 func SetBalance(
 	ctx context.Context,
 	mu state.Mutable,
-	addr codec.Address,
+	addr common.Address,
 	balance uint64,
 ) error {
-	k := BalanceKey(addr)
-	return setBalance(ctx, mu, k, balance)
-}
-
-func setBalance(
-	ctx context.Context,
-	mu state.Mutable,
-	key []byte,
-	balance uint64,
-) error {
-	return mu.Insert(ctx, key, binary.BigEndian.AppendUint64(nil, balance))
+	account, err := GetAccount(ctx, mu, addr)
+	if err != nil {
+		return err
+	}
+	accountDecoded, err := DecodeAccount(account)
+	if err != nil {
+		return err
+	}
+	accountDecoded.Balance = uint256.NewInt(0).SetUint64(balance)
+	encoded, err := EncodeAccount(accountDecoded)
+	if err != nil {
+		return err
+	}
+	return SetAccount(ctx, mu, addr, encoded)
 }
 
 func AddBalance(
 	ctx context.Context,
 	mu state.Mutable,
-	addr codec.Address,
+	addr common.Address,
 	amount uint64,
 ) (uint64, error) {
-	key, bal, _, err := getBalance(ctx, mu, addr)
+	bal, err := GetBalance(ctx, mu, addr)
+	if err == database.ErrNotFound { // if the account does not exist, we need to create it according to the EVM spec
+		encoded, err := EncodeAccount(&types.StateAccount{
+			Nonce:    0,
+			Balance:  uint256.NewInt(0).SetUint64(amount),
+			Root:     common.Hash{},
+			CodeHash: []byte{},
+		})
+		if err != nil {
+			return 0, err
+		}
+		err = mu.Insert(ctx, AccountKey(addr), encoded)
+		if err != nil {
+			return 0, err
+		}
+		return amount, nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -130,17 +111,26 @@ func AddBalance(
 			amount,
 		)
 	}
-	return nbal, setBalance(ctx, mu, key, nbal)
+	if nbal > consts.MaxUint64 {
+		return 0, fmt.Errorf(
+			"%w: balance overflow (bal=%d, addr=%v, amount=%d)",
+			ErrInvalidBalance,
+			bal,
+			addr,
+			amount,
+		)
+	}
+	return nbal, SetBalance(ctx, mu, addr, nbal)
 }
 
 func SubBalance(
 	ctx context.Context,
 	mu state.Mutable,
-	addr codec.Address,
+	addr common.Address,
 	amount uint64,
 ) (uint64, error) {
-	key, bal, ok, err := getBalance(ctx, mu, addr)
-	if !ok {
+	bal, err := GetBalance(ctx, mu, addr)
+	if err == database.ErrNotFound {
 		return 0, ErrInvalidBalance
 	}
 	if err != nil {
@@ -156,10 +146,31 @@ func SubBalance(
 			amount,
 		)
 	}
-	if nbal == 0 {
-		// If there is no balance left, we should delete the record instead of
-		// setting it to 0.
-		return 0, mu.Remove(ctx, key)
+	return nbal, SetBalance(ctx, mu, addr, nbal)
+}
+
+func EncodeAccount(account *types.StateAccount) ([]byte, error) {
+	p := codec.NewWriter(0, consts.MaxInt)
+	p.PackUint64(account.Nonce)
+	p.PackUint64(account.Balance.Uint64())
+	p.PackFixedBytes(account.Root.Bytes())
+	p.PackBytes(account.CodeHash)
+	return p.Bytes(), p.Err()
+}
+
+func DecodeAccount(data []byte) (*types.StateAccount, error) {
+	var account types.StateAccount
+
+	if len(data) == 0 { // todo: check if this is correct
+		account = *types.NewEmptyStateAccount()
+		return &account, nil
 	}
-	return nbal, setBalance(ctx, mu, key, nbal)
+	p := codec.NewReader(data, len(data))
+	account.Nonce = p.UnpackUint64(false)
+	account.Balance = uint256.NewInt(0).SetUint64(p.UnpackUint64(false))
+	rt := make([]byte, 32)
+	p.UnpackFixedBytes(len(rt), &rt)
+	account.Root = common.BytesToHash(rt)
+	p.UnpackBytes(-1, false, &account.CodeHash)
+	return &account, p.Err()
 }

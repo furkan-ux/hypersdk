@@ -113,7 +113,7 @@ func (s *Spammer) Spam(ctx context.Context, sh SpamHelper, terminate bool, symbo
 	if err != nil {
 		return err
 	}
-	actions := sh.GetTransfer(s.key.Address, 0, s.tracker.uniqueBytes())
+	actions := sh.GetTransfer(s.key.Address, 0, s.tracker.uniqueBytes(), factory)
 	maxUnits, err := chain.EstimateUnits(parser.Rules(time.Now().UnixMilli()), actions, factory)
 	if err != nil {
 		return err
@@ -234,7 +234,8 @@ func (s Spammer) broadcast(
 						return fmt.Errorf("insufficient funds (have=%d need=%d)", balance, feePerTx)
 					}
 					// Send transaction
-					actions := sh.GetActions()
+					actions := sh.GetActions(factory)
+					s.tracker.IncrementSent()
 					return issuer.Send(ctx, actions, factory, feePerTx)
 				})
 			}
@@ -318,7 +319,7 @@ func (s *Spammer) distributeFunds(ctx context.Context, cli *jsonrpc.JSONRPCClien
 		return nil, nil, fmt.Errorf("insufficient funds (have=%d need=%d)", s.balance, withholding)
 	}
 
-	distAmount := (s.balance - withholding) / uint64(s.numAccounts)
+	distAmount := (s.balance - withholding) / uint64(s.numAccounts*100)
 
 	utils.Outf("{{yellow}}distributing funds to each account{{/}}\n")
 
@@ -353,7 +354,7 @@ func (s *Spammer) distributeFunds(ctx context.Context, cli *jsonrpc.JSONRPCClien
 		factories[i] = f
 
 		// Send funds
-		actions := sh.GetTransfer(pk.Address, distAmount, s.tracker.uniqueBytes())
+		actions := sh.GetTransfer(pk.Address, distAmount, s.tracker.uniqueBytes(), factory)
 		_, tx, err := cli.GenerateTransactionManual(parser, actions, factory, feePerTx)
 		if err != nil {
 			return nil, nil, err
@@ -363,11 +364,12 @@ func (s *Spammer) distributeFunds(ctx context.Context, cli *jsonrpc.JSONRPCClien
 		}
 
 		// Log progress
-		if i%250 == 0 && i > 0 {
+		if i%1000 == 0 && i > 0 {
 			utils.Outf("{{yellow}}issued transfer to %d accounts{{/}}\n", i)
 		}
 	}
 	if err := p.Wait(); err != nil {
+		utils.Outf("{{red}}failed to distribute funds:{{/}} %v\n", err)
 		return nil, nil, err
 	}
 	utils.Outf("{{yellow}}distributed funds to %d accounts{{/}}\n", s.numAccounts)
@@ -409,7 +411,7 @@ func (s *Spammer) returnFunds(ctx context.Context, cli *jsonrpc.JSONRPCClient, p
 
 		// Send funds
 		returnAmt := balance - feePerTx
-		actions := sh.GetTransfer(s.key.Address, returnAmt, s.tracker.uniqueBytes())
+		actions := sh.GetTransfer(s.key.Address, returnAmt, s.tracker.uniqueBytes(), factories[i])
 		_, tx, err := cli.GenerateTransactionManual(parser, actions, factories[i], feePerTx)
 		if err != nil {
 			return err

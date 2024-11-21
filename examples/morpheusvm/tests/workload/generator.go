@@ -5,11 +5,13 @@ package workload
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"time"
 
-	"github.com/ava-labs/avalanchego/ids"
-	"github.com/stretchr/testify/require"
+	"math/rand"
 
+	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/hypersdk/api/indexer"
 	"github.com/ava-labs/hypersdk/api/jsonrpc"
 	"github.com/ava-labs/hypersdk/auth"
@@ -20,6 +22,7 @@ import (
 	"github.com/ava-labs/hypersdk/examples/morpheusvm/consts"
 	"github.com/ava-labs/hypersdk/examples/morpheusvm/vm"
 	"github.com/ava-labs/hypersdk/tests/workload"
+	"github.com/stretchr/testify/require"
 )
 
 var _ workload.TxGenerator = (*TxGenerator)(nil)
@@ -37,16 +40,29 @@ func NewTxGenerator(key ed25519.PrivateKey) *TxGenerator {
 }
 
 func (g *TxGenerator) GenerateTx(ctx context.Context, uri string) (*chain.Transaction, workload.TxAssertion, error) {
-	// TODO: no need to generate the clients every tx
 	cli := jsonrpc.NewJSONRPCClient(uri)
 	lcli := vm.NewJSONRPCClient(uri)
 
-	to, err := ed25519.GeneratePrivateKey()
+	// we directly generate the address to speed up the test
+	addr := make([]byte, 32)
+	_, err := rand.Read(addr)
 	if err != nil {
 		return nil, nil, err
 	}
+	address, err := hex.DecodeString(fmt.Sprintf("00%s", hex.EncodeToString(addr)))
+	if err != nil {
+		return nil, nil, err
+	}
+	toAddress := codec.Address(address)
 
-	toAddress := auth.NewED25519Address(to.PublicKey())
+	call := &actions.Transfer{
+		To:    toAddress,
+		Value: 1,
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
 	parser, err := lcli.Parser(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -54,10 +70,7 @@ func (g *TxGenerator) GenerateTx(ctx context.Context, uri string) (*chain.Transa
 	_, tx, _, err := cli.GenerateTransaction(
 		ctx,
 		parser,
-		[]chain.Action{&actions.Transfer{
-			To:    toAddress,
-			Value: 1,
-		}},
+		[]chain.Action{call},
 		g.factory,
 	)
 	if err != nil {
@@ -80,7 +93,7 @@ func confirmTx(ctx context.Context, require *require.Assertions, uri string, txI
 	require.Equal(receiverExpectedBalance, balance)
 	txRes, _, err := indexerCli.GetTx(ctx, txID)
 	require.NoError(err)
-	// TODO: perform exact expected fee, units check, and output check
+
 	require.NotZero(txRes.Fee)
 	require.Len(txRes.Outputs, 1)
 	transferOutputBytes := []byte(txRes.Outputs[0])
